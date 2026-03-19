@@ -1,0 +1,95 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_terraform:
+        description: "Run `terraform apply` for infra changes"
+        required: false
+        default: "false"
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & deploy Lambda
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build Lambda deployment package
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          rm -rf build lambda_package.zip
+          mkdir -p build
+          # Install runtime deps directly into the package root (Lambda layout).
+          pip install \
+            --no-cache-dir \
+            --platform manylinux2014_x86_64 \
+            --target build \
+            --implementation cp \
+            --python-version 3.11 \
+            --only-binary=:all: \
+            --upgrade \
+            -r requirements.txt
+          # Copy app code into the same root.
+          cp -r app build/app
+          cp lambda_handler.py build/lambda_handler.py
+          # Strip test/dev artifacts to keep the zip small.
+          find build -type d \( -name "__pycache__" -o -name "tests" -o -name "*.dist-info" \) -prune -exec rm -rf {} + || true
+          (cd build && zip -r ../lambda_package.zip .) >/dev/null
+          ls -lh lambda_package.zip
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update Lambda function code
+        run: |
+          aws lambda update-function-code \
+            --function-name documind-prod \
+            --zip-file fileb://backend/lambda_package.zip \
+            --publish
+
+      - name: Wait for Lambda update to settle
+        run: aws lambda wait function-updated --function-name documind-prod
+
+      # ------------------------------------------------------------------
+      # Optional: apply infra changes from terraform/ when manually triggered.
+      # ------------------------------------------------------------------
+      - name: Setup Terraform
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_terraform == 'true' }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+
+      - name: Terraform init
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_terraform == 'true' }}
+        working-directory: terraform
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_terraform == 'true' }}
+        working-directory: terraform
+        env:
+          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_pinecone_api_key: ${{ secrets.PINECONE_API_KEY }}
+          TF_VAR_pinecone_index_name: ${{ secrets.PINECONE_INDEX_NAME }}
+          TF_VAR_lambda_zip_path: ${{ github.workspace }}/backend/lambda_package.zip
+        run: terraform apply -auto-approve -input=false
